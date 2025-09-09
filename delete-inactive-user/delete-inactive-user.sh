@@ -1,10 +1,9 @@
 #!/bin/bash
-
 set -euo pipefail
 
-DD_API_KEY=""
-DD_APP_KEY=""
-SITE="datadoghq.com"
+DD_API_KEY="${DD_API_KEY:-}"
+DD_APP_KEY="${DD_APP_KEY:-}"
+SITE="${SITE:-datadoghq.com}"
 
 # Get users from Audit Events
 get_users_audit_events() {
@@ -17,43 +16,60 @@ get_users_audit_events() {
     | jq -r '.data[].attributes.attributes.usr.uuid' | sort -u
 }
 
-# Get users from the list of the existing Users
+# Get users list with pagination
 get_users() {
-    curl -sS --compressed -G "https://api.${SITE}/api/v2/users" \
+  local page=0
+  local size=50
+  : > users_raw.txt
+
+  while :; do
+    resp="$(
+      curl -sS --compressed -G "https://api.${SITE}/api/v2/users" \
         -H "Accept: application/json" \
         -H "DD-API-KEY: ${DD_API_KEY}" \
         -H "DD-APPLICATION-KEY: ${DD_APP_KEY}" \
-    | jq -r '.data[].id' | sort -u
+        --data-urlencode "page[size]=${size}" \
+        --data-urlencode "page[number]=${page}"
+    )"
+
+    # Write user ID
+    if ! jq -e '.data | length > 0' >/dev/null <<<"$resp"; then
+      break
+    fi
+    jq -r '.data[].id' <<<"$resp" >> users_raw.txt
+    page=$((page + 1))
+  done
+
+  sort -u users_raw.txt
 }
 
-# Deactivate users
+# Deactivate users (disable)
 delete_users() {
-    local user_id="${1}"
-    curl -X DELETE "https://api.datadoghq.com/api/v2/users/${user_id}" \
-        -H "DD-API-KEY: ${DD_API_KEY}" \
-        -H "DD-APPLICATION-KEY: ${DD_APP_KEY}"
+  local user_id="${1}"
+  curl -sS -X DELETE "https://api.${SITE}/api/v2/users/${user_id}" \
+    -H "DD-API-KEY: ${DD_API_KEY}" \
+    -H "DD-APPLICATION-KEY: ${DD_APP_KEY}"
 }
 
 # Remove temp files
 cleanup() {
-    rm -f audit_users.txt users.txt
+  rm -f audit_users_raw.txt users_raw.txt audit_users.txt users.txt
 }
 
 main() {
-    get_users_audit_events > audit_users.txt
-    get_users > users.txt
 
-    # Compare the two lists to find users not in audit events 
-    list_users=$(comm -23 users.txt audit_users.txt) 
+  get_users_audit_events > audit_users.txt
+  get_users > users.txt
 
-    # Deactivate users from the list  
-    for user in $list_users; do 
-        delete_users $user
-    done
+  # Get users that are not in audit_users.txt 
+  list_users=$(comm -23 users.txt audit_users.txt)
 
-    # Remove temporary files  
-    cleanup
+  # Deactivate users from list
+  for user in $list_users; do
+    delete_users "$user"
+  done
+
+  cleanup
 }
 
 main "$@"
-
